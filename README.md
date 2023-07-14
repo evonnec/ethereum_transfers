@@ -26,3 +26,17 @@ Data Contents
 - Ethereum Decoded Logs (Parquet)
 - ERC-20 Token List (csv)
 
+
+### Examine the data
+
+BLOCK_DATE is transaction date  
+`sample_output1 = ["ADDRESS", "BLOCK_DATE", "count_of_transfers"]`  
+`sample_output2 = ["ADDRESS", "BLOCK_DATE", "quantity_of_transfers"]`
+  
+If token addresss exists in tokens.csv, this is included in the metric, else next transaction
+Fields `symbol` and `name` are applicable in determining if the token's address from the logs, exist
+
+
+
+
+

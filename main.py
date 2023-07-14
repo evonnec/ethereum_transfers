@@ -1,33 +1,6 @@
-"""
-## Problem Statement
-
-Use the Ethereum Logs data below to find the most transferred ERC-20 token per day. 
-A list of ERC-20 tokens is also provided.
-
-Specifically, measure transfer volume with two metrics: 
-(1) count of transfers and (2) sum of transfer amounts.
-
-The resulting dataset should be two CSVs, one for each metric, each with 3 columns 
-(day, token address, transfer metric), ordered by transfer metric descending, limit 100.
-
-Data Contents
-
-- Ethereum Decoded Logs (Parquet)
-- ERC-20 Token List (csv)
-"""
-
 import pandas as pd
 import json
 import logging
-
-# BLOCK_DATE is transaction date
-# sample_output1 = ["ADDRESS", "BLOCK_DATE", "count_of_transfers"]
-# sample_output2 = ["ADDRESS", "BLOCK_DATE", "quantity_of_transfers"]
-
-
-# if transaction addresss exists in tokens, this is included in the metric, else
-# next transaction
-
 
 def write_new_output(input_file: str, output_file: str) -> None:
     """
@@ -123,7 +96,7 @@ def generate_output(input_file: str, check_file: str, metric_type: str) -> None:
     # Be sure to have the three columns filled in.
     # Does `name` in tokens.csv have to contain `ERC-20` string to ID as token?
     # Or is each `name` in tokens.csv an ERC-20 token?
-    # Assumption: each item in tokens.csv is an ERC-20 token that has a name and symbol.
+    # ASSUMPTION: each item in tokens.csv is an ERC-20 token that has a name and symbol.
     # Add a count to the df -- a count based on the number of transfers
     if metric_type == "count_of_transfers":
         count_of_transfers(df=df, metric_type=metric_type)
@@ -132,7 +105,7 @@ def generate_output(input_file: str, check_file: str, metric_type: str) -> None:
     else:
         raise ValueError(f"Invalid metric type: {metric_type}")
 
-# make argparse arguments for these
+# TODO: make argparse arguments for these
 INPUT = "eth_logs_decoded_2023_sample"
 OUTPUT = "eth_logs_decoded_2023_sample_100.gzip"
 VERIFY = "tokens.csv"
