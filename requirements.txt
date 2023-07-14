@@ -1,0 +1,8 @@
+mypy
+black
+ruff
+pandas
+pyarrow
+pandas-stubs
+pyarrow-stubs
+fastparquet
