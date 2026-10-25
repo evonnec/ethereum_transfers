@@ -1,0 +1,267 @@
+# CI for ethereum-transfers.
+#
+# Stages:  lint | format | typecheck | test (3.13, 3.14, 3.15)  ->  build  ->  release  ->  publish
+#   * Every event runs the four checks and the build (sdist + wheel, smoke-tested, uploaded as `dist`).
+#   * A pushed `v*` tag additionally verifies tag == project version and creates a GitHub Release
+#     with the distributions attached (always on).
+#   * Uploading to a package index is opt-in: set repo variable PUBLISH_TO_PYPI=true and register
+#     a trusted publisher (workflow `ci.yml`, environment `pypi`). PYPI_PUBLISH_URL overrides the
+#     index (default: PyPI).
+#
+# All tools come from the locked environment (`uv sync --locked` + `uv run`), so CI uses the
+# same ruff / mypy / pytest versions as local development.
+#
+# uv cache: keyed on uv.lock. `enable-cache: auto` caches on main, PR and manual runs but skips
+# the cache on tag pushes, so nothing in a release run is restored from a (poisonable) cache.
+# The release/publish jobs install nothing and disable it outright.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  # No branch filter: stacked PRs target each other's branches, not just main.
+  pull_request:
+  workflow_dispatch:
+
+# Default for every job; jobs that need more elevate individually.
+permissions:
+  contents: read
+
+concurrency:
+  # PR runs share a group per PR and cancel superseded runs. Every other run (main, tags,
+  # manual) gets a unique group, so it is never cancelled or queued behind another run.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    name: Lint (ruff check)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.13"
+          enable-cache: auto
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked
+      - run: uv run ruff check --output-format=github
+
+  format:
+    name: Format (ruff format)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.13"
+          enable-cache: auto
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked
+      - run: uv run ruff format --check
+
+  typecheck:
+    name: Typecheck (mypy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.13"
+          enable-cache: auto
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked
+      - run: uv run mypy
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13", "3.14", "3.15"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: auto
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked
+      - id: pytest
+        run: uv run pytest
+      # pytest-cov (enabled via addopts in pyproject) leaves a coverage data file; render it
+      # into the job summary and as XML/HTML artifacts, even when tests fail.
+      - name: Coverage report
+        if: ${{ !cancelled() && steps.pytest.outcome != 'skipped' }}
+        env:
+          PYTHON_VERSION: ${{ matrix.python-version }}
+        run: |
+          if uv run coverage report --format=markdown --fail-under=0 > "$RUNNER_TEMP/coverage.md"; then
+            {
+              echo "### Coverage (Python ${PYTHON_VERSION})"
+              echo
+              cat "$RUNNER_TEMP/coverage.md"
+            } >> "$GITHUB_STEP_SUMMARY"
+            uv run coverage xml --fail-under=0 -o coverage.xml
+            uv run coverage html --fail-under=0 -d htmlcov
+          else
+            echo "::warning::No coverage data found; enable pytest-cov (--cov) in the pytest config."
+          fi
+      - name: Upload coverage
+        if: ${{ !cancelled() && steps.pytest.outcome != 'skipped' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-python-${{ matrix.python-version }}
+          path: |
+            coverage.xml
+            htmlcov/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  build:
+    name: Build distributions
+    needs: [lint, format, typecheck, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.13"
+          enable-cache: auto
+          cache-dependency-glob: uv.lock
+      - run: uv build
+      - name: Smoke-test the wheel in a clean environment
+        run: |
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one wheel in dist/, found ${#wheels[@]}"
+            exit 1
+          fi
+          wheel="$(realpath "${wheels[0]}")"
+          venv="$RUNNER_TEMP/smoke-venv"
+          uv venv --no-project "$venv"
+          uv pip install --python "$venv" "$wheel"
+          # Run outside the checkout so nothing from the source tree can be imported.
+          cd "$RUNNER_TEMP"
+          "$venv/bin/ethereum-transfers" --help
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  # Single required status check for branch protection. GitHub treats a skipped job as
+  # passing, so `build` alone is not enough: when a check fails, build is skipped.
+  ci-ok:
+    name: CI OK
+    if: ${{ always() }}
+    needs: [lint, format, typecheck, test, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail unless every required job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            if [ "$result" != "success" ]; then
+              echo "::error::A required job finished with result: ${result}"
+              exit 1
+            fi
+          done
+          echo "All required jobs succeeded"
+
+  release:
+    name: GitHub Release
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the release and upload its assets
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          enable-cache: false
+      - name: Verify tag matches project version
+        run: |
+          version="$(uv version --short)"
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match project version ${version} (expected v${version})"
+            exit 1
+          fi
+          echo "Tag ${GITHUB_REF_NAME} matches project version ${version}"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=()
+          if [[ "${GITHUB_REF_NAME#v}" =~ (a|b|rc)[0-9]+|\.dev[0-9]+ ]]; then
+            prerelease=(--prerelease)
+          fi
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            # Re-run of a tag build: refresh the assets on the existing release.
+            gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" --generate-notes --verify-tag "${prerelease[@]}"
+          fi
+
+  publish:
+    name: Publish to package index
+    needs: release
+    # Off by default: the project name is not registered on PyPI. Opt in with repo variable
+    # PUBLISH_TO_PYPI=true after configuring a trusted publisher for this workflow + environment.
+    if: >-
+      github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+      && vars.PUBLISH_TO_PYPI == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+    permissions:
+      id-token: write # OIDC token for trusted publishing; no other scopes needed
+    steps:
+      # No checkout: this job only needs the already-built, smoke-tested distributions.
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          enable-cache: false
+          ignore-empty-workdir: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - name: Publish with uv (trusted publishing)
+        env:
+          UV_PUBLISH_URL: ${{ vars.PYPI_PUBLISH_URL || 'https://upload.pypi.org/legacy/' }}
+        run: uv publish --trusted-publishing always dist/*

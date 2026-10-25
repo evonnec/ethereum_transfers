@@ -1,3 +1,7 @@
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14"]
+build-backend = "uv_build"
+
 [project]
 name = "ethereum-transfers"
 version = "0.1.0"
@@ -13,11 +17,16 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: 3.15",
+    "Environment :: Console",
+    "Typing :: Typed",
 ]
 dependencies = [
     "pandas>=3.0",
     "pyarrow>=26.0",
 ]
+
+[project.scripts]
+ethereum-transfers = "ethereum_transfers.cli:main"
 
 [dependency-groups]
 dev = [
@@ -29,7 +38,8 @@ dev = [
 ]
 
 [tool.uv]
-package = false
+# lets setup-uv in CI pick a uv that understands this project and lockfile
+required-version = ">=0.13.5"
 
 [tool.ruff]
 target-version = "py313"
@@ -84,6 +94,7 @@ ignore = [
     "D",        # test names are the documentation
     "S101",     # pytest is built on `assert`
     "PLR2004",  # expected values in assertions are not magic numbers
+    "S603",     # subprocess runs of our own entry points with fixed arguments
 ]
 
 [tool.ruff.lint.pydocstyle]
@@ -95,6 +106,29 @@ docstring-code-format = true
 [tool.mypy]
 python_version = "3.13"
 strict = true
-files = ["main.py"]
+files = ["src", "tests"]
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+
+[tool.pytest]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = [
+    "--import-mode=importlib",
+    "-ra",
+    "--cov=ethereum_transfers",
+]
+strict_config = true
+strict_markers = true
+strict_xfail = true
+filterwarnings = ["error"]
+markers = [
+    "integration: needs the real input data; skipped unless ETHEREUM_TRANSFERS_LOGS and ETHEREUM_TRANSFERS_TOKENS point at it",
+]
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+fail_under = 95
+show_missing = true
