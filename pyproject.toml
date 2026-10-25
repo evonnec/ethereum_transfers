@@ -1,0 +1,100 @@
+[project]
+name = "ethereum-transfers"
+version = "0.1.0"
+description = "Find the most transferred ERC-20 token per day in decoded Ethereum logs, by transfer count and by transfer amount."
+readme = "README.md"
+requires-python = ">=3.13"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [{ name = "EvonneC" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+]
+dependencies = [
+    "pandas>=3.0",
+    "pyarrow>=26.0",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.4",
+    "pandas-stubs>=3.0.5",
+    "pytest>=9.1",
+    "pytest-cov>=7.1",
+    "ruff>=0.17.2",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "F",     # Pyflakes
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "C90",   # mccabe complexity
+    "I",     # isort
+    "N",     # pep8-naming
+    "D",     # pydocstyle (numpy convention, below)
+    "UP",    # pyupgrade (to the 3.13 floor)
+    "S",     # flake8-bandit
+    "BLE",   # flake8-blind-except
+    "B",     # flake8-bugbear
+    "A",     # flake8-builtins
+    "C4",    # flake8-comprehensions
+    "DTZ",   # flake8-datetimez
+    "T10",   # flake8-debugger
+    "ICN",   # flake8-import-conventions (pd, np, pa, ...)
+    "LOG",   # flake8-logging
+    "G",     # flake8-logging-format
+    "PIE",   # flake8-pie
+    "PT",    # flake8-pytest-style
+    "RSE",   # flake8-raise
+    "RET",   # flake8-return
+    "SLF",   # flake8-self
+    "SIM",   # flake8-simplify
+    "TID",   # flake8-tidy-imports
+    "ARG",   # flake8-unused-arguments
+    "PTH",   # flake8-use-pathlib
+    "ERA",   # eradicate (commented-out code)
+    "PD",    # pandas-vet
+    "PGH",   # pygrep-hooks (no blanket `type: ignore` / `noqa`)
+    "PL",    # Pylint
+    "TRY",   # tryceratops
+    "FLY",   # flynt
+    "NPY",   # NumPy-specific rules
+    "PERF",  # Perflint
+    "FURB",  # refurb
+    "RUF",   # Ruff-specific rules
+]
+ignore = [
+    "TRY003",  # long messages in `raise ValueError(f"...")` are fine for a small CLI
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "D",        # test names are the documentation
+    "S101",     # pytest is built on `assert`
+    "PLR2004",  # expected values in assertions are not magic numbers
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+files = ["main.py"]
+warn_unreachable = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
