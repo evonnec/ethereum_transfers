@@ -18,8 +18,25 @@ dist/
 coverage.xml
 htmlcov/
 
-# Local input data (too large for git; see README)
-eth_logs_decoded_2023_sample/
+# Local input data (too large for git; see README). Anchored to the repository
+# root so that test fixtures with the same names (e.g. tests/**/tokens.csv) are
+# not ignored.
+/eth_logs_decoded_2023_sample/
+/tokens.csv
+/*.parquet
 *.gzip
 *.zip
-tokens.csv
+
+# Generated outputs (default `--output-dir output`, and CSVs written to the root)
+/output/
+/count_of_transfers.csv
+/quantity_transferred.csv
+
+# Agent worktrees and scratch space inside the checkout
+.claude/worktrees/
+.claude/work/
+.claude/settings.local.json
+
+# Local environment
+.env
+.envrc
