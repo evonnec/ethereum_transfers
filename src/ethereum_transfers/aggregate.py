@@ -73,8 +73,10 @@ def partial_aggregate(batch: pa.RecordBatch | pa.Table) -> pa.Table:
         raise ValueError(f"transfer batch is missing column(s): {', '.join(missing)}")
     limbs = decode_uint256_words(batch.column("DATA")).astype(np.uint64)
     table = batch if isinstance(batch, pa.Table) else pa.Table.from_batches([batch])
-    table = table.select(_KEYS).append_column(
-        _COUNT, pa.array(np.ones(len(limbs), dtype=np.uint64))
+    table = (
+        table.select(_KEYS)
+        .set_column(1, "ADDRESS", pc.utf8_lower(table["ADDRESS"]))
+        .append_column(_COUNT, pa.array(np.ones(len(limbs), dtype=np.uint64)))
     )
     for i, name in enumerate(_LIMBS):
         table = table.append_column(name, pa.array(np.ascontiguousarray(limbs[:, i])))

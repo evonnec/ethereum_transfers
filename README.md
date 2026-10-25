@@ -41,6 +41,9 @@ directory (default: `output/`). `--logs` takes a parquet file or a directory of 
 parts (Spark marker files such as `_SUCCESS` are ignored). The full dataset takes about
 2 seconds and 1.2 GB of memory, because the input is streamed (see
 [performance](#performance)).
+A missing or empty input, a token list without an `address` column or a malformed `DATA`
+value prints `ethereum-transfers: error: ...` to stderr and exits with status 1 (invalid
+arguments exit with 2). Hex in `ADDRESS` and `TOPIC0` is matched case-insensitively.
 
 To make a smaller input for experiments, take the first rows of the dataset (also
 streamed):
@@ -65,6 +68,7 @@ The problem statement (below) leaves some definitions open. This is how they are
 | "Most transferred token per day" + "limit 100" | The top token of each day, ordered by the metric descending, at most 100 rows. With 8 days of data that gives 8 rows; the limit matters for more than 100 days. `--per-day N\|all` and `--limit N\|all` give other readings, e.g. `--per-day all` ranks all (day, token) pairs together. |
 | Day | `BLOCK_DATE`, which is the UTC date of `BLOCK_TIMESTAMP`. |
 | Ties | Within a day, the lower token address wins; rows with equal metrics are ordered by day, then address. |
+| Duplicate logs | Not de-duplicated: each input row is one log. The data arrived through Kafka (`_KAFKA__*` columns), where at-least-once delivery can repeat rows, so this was checked: all 7,485,717 ERC-20 transfer rows have a unique (`TRANSACTION_HASH`, `LOG_INDEX`), and no block number has more than one `BLOCK_HASH` (no reorged blocks). For a source without that guarantee, de-duplicate on (`TRANSACTION_HASH`, `LOG_INDEX`) upstream. |
 
 Self-transfers (`from == to`) and zero-value transfers are transfers and are counted.
 
