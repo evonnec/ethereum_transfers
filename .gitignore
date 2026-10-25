@@ -1,2 +1,25 @@
+# macOS
 .DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
 .venv/
+build/
+dist/
+
+# Tool caches and reports
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Local input data (too large for git; see README)
+eth_logs_decoded_2023_sample/
+*.gzip
+*.zip
+tokens.csv
