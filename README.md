@@ -41,6 +41,9 @@ directory (default: `output/`). `--logs` takes a parquet file or a directory of 
 parts (Spark marker files such as `_SUCCESS` are ignored). The full dataset takes about
 2 seconds and 1.2 GB of memory, because the input is streamed (see
 [performance](#performance)).
+A missing or empty input, a token list without an `address` column or a malformed `DATA`
+value prints `ethereum-transfers: error: ...` to stderr and exits with status 1 (invalid
+arguments exit with 2). Hex in `ADDRESS` and `TOPIC0` is matched case-insensitively.
 
 To make a smaller input for experiments, take the first rows of the dataset (also
 streamed):
