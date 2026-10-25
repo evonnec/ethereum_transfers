@@ -2,11 +2,26 @@
 Measure Ethereum `ERC-20`` transfer volume with two metrics: (1) count of transfers and (2) sum of transfer amounts  
 
 ## set up the environment
-`python -m venv ethereum`  
-`source ethereum/bin/activate`  
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) (e.g. `brew install uv`), then:
 
-## install requirements
-`pip install -r requirements.txt`  
+```sh
+uv sync
+```
+
+This creates `.venv/` from `uv.lock`, dev tools included. If the Python pinned in
+`.python-version` (3.15) isn't installed, uv downloads it. Python 3.13+ is supported.
+
+## run
+```sh
+uv run main.py
+```
+
+## development checks
+```sh
+uv run ruff check           # lint
+uv run ruff format --check  # formatting
+uv run mypy                 # strict type check
+```
 
 ## problem statement
 Use the Ethereum Logs data below to find the most transferred ERC-20 token per day.  
