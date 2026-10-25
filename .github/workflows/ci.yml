@@ -173,6 +173,27 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # Single required status check for branch protection. GitHub treats a skipped job as
+  # passing, so `build` alone is not enough: when a check fails, build is skipped.
+  ci-ok:
+    name: CI OK
+    if: ${{ always() }}
+    needs: [lint, format, typecheck, test, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail unless every required job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            if [ "$result" != "success" ]; then
+              echo "::error::A required job finished with result: ${result}"
+              exit 1
+            fi
+          done
+          echo "All required jobs succeeded"
+
   release:
     name: GitHub Release
     needs: build
