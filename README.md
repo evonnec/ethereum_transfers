@@ -2,6 +2,17 @@
 Find the most transferred ERC-20 token per day in decoded Ethereum logs, measured two
 ways: (1) the count of transfers and (2) the sum of the transferred amounts.
 
+## problem
+The inputs are a sample of decoded Ethereum event logs (parquet) and a list of ERC-20
+token contracts (`tokens.csv`). For each day, find the token that moved the most, judged
+by two separate measures:
+
+- how many transfers of the token happened that day, and
+- the total amount of the token transferred that day.
+
+Each measure gets its own CSV with three columns (day, token address, value), sorted from
+the largest value down and capped at 100 rows.
+
 ## set up the environment
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/) (e.g. `brew install uv`), then:
 
@@ -56,16 +67,37 @@ uv run ethereum-transfers sample --input eth_logs_decoded_2023_sample \
 The first rows in file order are not a random sample: the parquet parts are split by
 date, so the first million rows cover only 3 of the 8 days, and only part of each.
 
+## how it works
+One streamed pass over the logs produces a per-(day, token) aggregate; each metric is a
+ranking of one of its columns.
+
+```mermaid
+flowchart TD
+    tokens[("tokens.csv")] -->|"read_token_addresses: lower-case, de-duplicate, validate"| addrs["listed token addresses"]
+    logs[("eth_logs_decoded_2023_sample/ (parquet parts)")] --> scan
+    addrs --> scan
+    scan["scan_transfers: parquet scan, one file at a time<br/>reads only BLOCK_DATE, ADDRESS, DATA, TOPIC0, TOPIC3<br/>filter pushed down: Transfer TOPIC0, TOPIC3 null,<br/>one 32-byte DATA word, ADDRESS in the token list"]
+    scan -->|"record batches"| partial["partial_aggregate, per batch:<br/>per (day, token) transfer count and<br/>sums of the eight 32-bit limbs of DATA (uint64)"]
+    partial --> combine["combine_partials: add the partial sums,<br/>recombine the limbs into exact Python ints"]
+    combine --> agg["aggregate: day, token_address,<br/>transfer_count, transfer_amount"]
+    agg -->|"rank_top on transfer_count"| count["output/count_of_transfers.csv"]
+    agg -->|"rank_top on transfer_amount"| quantity["output/quantity_transferred.csv"]
+```
+
+`rank_top` keeps the top `--per-day` tokens of each day (default 1) and then the top
+`--limit` rows overall (default 100). The modules behind each step are listed under
+[project layout](#project-layout).
+
 ## interpretation and assumptions
-The problem statement (below) leaves some definitions open. This is how they are settled:
+The task leaves some definitions open. This is how they are settled:
 
 | question | answer |
 |---|---|
 | What is a transfer? | An ERC-20 `Transfer(address indexed from, address indexed to, uint256 value)` log: `TOPIC0` is `0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef` (keccak256 of the signature), `TOPIC3` is null and `DATA` is a single 32-byte word. ERC-721 transfers share that `TOPIC0` but carry the token id in `TOPIC3` with empty `DATA`, so they are excluded. Other events from token contracts (Approval, Deposit, Withdrawal, ...) are not transfers. |
 | What is an ERC-20 token? | A contract whose `ADDRESS` is listed in `tokens.csv`: addresses are lower-cased and de-duplicated, and `name`/`symbol`/`decimals` are not required (MKR, for example, has `bytes32` metadata that the list leaves empty). |
 | Where does the amount come from? | `DATA`, decoded as an unsigned 256-bit integer, as in [Reading ERC-20 token event logs](https://goethereumbook.org/en/event-read-erc20/). The decoded `NAME`/`PARAMS` columns are not used: `NAME` is shared by unrelated events, and the key names inside `PARAMS` vary even within one token contract. |
-| "Sum of transfer amounts": which units? | Raw base units, summed exactly (Python integers; a daily sum here reaches 257 bits). No `decimals` scaling: without prices, amounts of different tokens are not comparable in any unit, and `decimals` is missing or implausible for many tokens. |
-| "Most transferred token per day" + "limit 100" | The top token of each day, ordered by the metric descending, at most 100 rows. With 8 days of data that gives 8 rows; the limit matters for more than 100 days. `--per-day N\|all` and `--limit N\|all` give other readings, e.g. `--per-day all` ranks all (day, token) pairs together. |
+| Which units is the amount summed in? | Raw base units, summed exactly (Python integers; a daily sum here reaches 257 bits). No `decimals` scaling: without prices, amounts of different tokens are not comparable in any unit, and `decimals` is missing or implausible for many tokens. |
+| One token per day, and the 100-row cap | The top token of each day, ordered by the metric descending, at most 100 rows. With 8 days of data that gives 8 rows; the limit matters for more than 100 days. `--per-day N\|all` and `--limit N\|all` give other readings, e.g. `--per-day all` ranks all (day, token) pairs together. |
 | Day | `BLOCK_DATE`, which is the UTC date of `BLOCK_TIMESTAMP`. |
 | Ties | Within a day, the lower token address wins; rows with equal metrics are ordered by day, then address. |
 | Duplicate logs | Not de-duplicated: each input row is one log. The data arrived through Kafka (`_KAFKA__*` columns), where at-least-once delivery can repeat rows, so this was checked: all 7,485,717 ERC-20 transfer rows have a unique (`TRANSACTION_HASH`, `LOG_INDEX`), and no block number has more than one `BLOCK_HASH` (no reorged blocks). For a source without that guarantee, de-duplicate on (`TRANSACTION_HASH`, `LOG_INDEX`) upstream. |
@@ -186,20 +218,4 @@ Once all checks pass, `uv build` creates the sdist and wheel. The wheel is smoke
 
 **Publishing to a package index** is off by default. To turn it on, register a trusted publisher on the index (workflow `ci.yml`, environment `pypi`) and set the repository variable `PUBLISH_TO_PYPI=true`. Set `PYPI_PUBLISH_URL` to target a different index, e.g. TestPyPI's `https://test.pypi.org/legacy/`.
 
-## problem statement
-Use the Ethereum Logs data below to find the most transferred ERC-20 token per day.  
-  
-A list of ERC-20 tokens is also provided in `tokens.csv`.  
-  
-Specifically, measure transfer volume with two metrics:  
-(1) count of transfers  
-(2) sum of transfer amounts  
-  
-The resulting dataset should be two CSVs, one for each metric, each with 3 columns  
-  
-(day, token address, transfer metric), ordered by transfer metric descending, limit 100.  
-  
-Data Contents  
-  
-- Ethereum Decoded Logs (Parquet)
-- ERC-20 Token List (csv)
+The `CI OK` job is the required status check for `main` (repository ruleset), so a pull request can merge only when every check and the build succeed.
