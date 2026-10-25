@@ -9,7 +9,12 @@ import pandas as pd
 import pytest
 
 from ethereum_transfers import __version__
-from ethereum_transfers.cli import DEFAULT_LOGS, DEFAULT_TOKENS, main
+from ethereum_transfers.cli import (
+    DEFAULT_LOGS,
+    DEFAULT_OUTPUT_DIR,
+    DEFAULT_TOKENS,
+    main,
+)
 
 CSV_NAMES = ["count_of_transfers.csv", "quantity_transferred.csv"]
 
@@ -66,16 +71,52 @@ def test_run_metric_option_selects_the_metrics(
 def test_no_command_runs_with_the_default_paths(
     inputs: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # the default --logs is the full dataset directory of parquet parts
     logs_path, tokens_path = inputs
     workdir = tmp_path / "workdir"
-    workdir.mkdir()
-    shutil.copy(logs_path, workdir / DEFAULT_LOGS)
+    (workdir / DEFAULT_LOGS).mkdir(parents=True)
+    shutil.copy(logs_path, workdir / DEFAULT_LOGS / "part-00000.snappy.parquet")
+    (workdir / DEFAULT_LOGS / "_SUCCESS").touch()
     shutil.copy(tokens_path, workdir / DEFAULT_TOKENS)
     monkeypatch.chdir(workdir)
 
     assert main([]) == 0
 
-    assert csv_names(workdir) == CSV_NAMES
+    assert csv_names(workdir / DEFAULT_OUTPUT_DIR) == CSV_NAMES
+
+
+@pytest.mark.parametrize(
+    ("options", "expected_rows"),
+    [
+        ([], 3),
+        (["--limit", "2"], 2),
+        (["--per-day", "all"], 6),
+        (["--per-day", "ALL", "--limit", "all"], 6),
+        (["--per-day", "2", "--limit", "4"], 4),
+        (["--limit", "0"], 0),
+    ],
+    ids=[
+        "default",
+        "limit-2",
+        "per-day-all",
+        "all-all",
+        "per-day-2-limit-4",
+        "limit-0",
+    ],
+)
+def test_run_per_day_and_limit_options(
+    inputs: tuple[Path, Path], tmp_path: Path, options: list[str], expected_rows: int
+) -> None:
+    # the `logs` fixture has transfers from listed tokens in 6 (day, token)
+    # pairs over 3 days
+    output_dir = tmp_path / "out"
+
+    argv = [*run_args(inputs, output_dir), "-m", "count_of_transfers", *options]
+    assert main(argv) == 0
+
+    result = pd.read_csv(output_dir / "count_of_transfers.csv", dtype=str)
+    assert list(result.columns) == ["day", "token_address", "count_of_transfers"]
+    assert len(result) == expected_rows
 
 
 @pytest.mark.parametrize(
@@ -103,6 +144,11 @@ def test_version(capsys: pytest.CaptureFixture[str]) -> None:
         ["run", "--metric", "bogus"],
         ["bogus"],
         ["sample", "--rows", "many"],
+        ["sample", "--rows", "-1"],
+        ["run", "--per-day", "0"],
+        ["run", "--per-day", "some"],
+        ["run", "--limit", "-1"],
+        ["run", "--limit", "1.5"],
     ],
     ids=" ".join,
 )

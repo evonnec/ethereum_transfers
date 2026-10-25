@@ -1,77 +1,180 @@
-"""Read the input files, write the metric CSVs, and sample large inputs."""
+"""
+Read the inputs, stream the transfer logs, write the metric CSVs and samples.
+
+All parquet reading is streamed with column projection and filters pushed
+down to the scan, so memory stays bounded by roughly one parquet row group no
+matter how large the input is.
+"""
+
+from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.csv as pacsv
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
 
-from ethereum_transfers.metrics import Metric, compute_metric, join_tokens
+from ethereum_transfers.aggregate import INPUT_COLUMNS
+from ethereum_transfers.transfers import erc20_transfer_filter
 
 logger = logging.getLogger(__name__)
 
 SAMPLE_ROWS: Final = 1_000_000
+"""Default number of rows kept by `write_head_sample`."""
+
+BATCH_ROWS: Final = 262_144
+"""Maximum rows per record batch when streaming parquet input."""
+
+_ADDRESS_PATTERN: Final = r"^0x[0-9a-f]{40}$"
 
 
-def write_new_output(
-    input_file: Path, output_file: Path, *, n_rows: int = SAMPLE_ROWS
-) -> None:
+def read_token_addresses(path: Path) -> pa.Array[Any]:
     """
-    Make a smaller file for testing purposes.
+    Read the token list and return its distinct contract addresses.
+
+    Every address listed in the file counts as an ERC-20 token, whether or
+    not its ``name``, ``symbol`` or ``decimals`` are filled in (tokens such as
+    MKR publish ``bytes32`` metadata that token lists often leave empty).
 
     Parameters
     ----------
-    input_file : Path
-        Parquet file or directory to read.
-    output_file : Path
-        Gzip-compressed parquet file to write.
-    n_rows : int, default 1_000_000
-        Number of leading rows of `input_file` to keep.
+    path : Path
+        CSV file with an ``address`` column (``tokens.csv``).
 
-    Notes
-    -----
-    Reads all of `input_file` into memory before keeping the first rows.
+    Returns
+    -------
+    pa.Array
+        Distinct lower-case addresses, in first-seen order.
+
+    Raises
+    ------
+    ValueError
+        If the file has no ``address`` column or an address is not ``0x``
+        followed by 40 hex digits.
     """
-    sample = pd.read_parquet(input_file).head(n_rows)
-    sample.to_parquet(output_file, engine="pyarrow", compression="gzip")
-    logger.info("wrote first %d rows of %s to %s", len(sample), input_file, output_file)
+    try:
+        table = pacsv.read_csv(
+            path,
+            convert_options=pacsv.ConvertOptions(
+                include_columns=["address"],
+                column_types={"address": pa.string()},
+                strings_can_be_null=False,
+            ),
+        )
+    except pa.ArrowKeyError as error:
+        raise ValueError(f"{path}: the token list has no 'address' column") from error
+    addresses = pc.utf8_lower(table["address"]).combine_chunks()
+    valid = pc.match_substring_regex(addresses, _ADDRESS_PATTERN)
+    if not pc.all(valid).as_py():
+        first_bad = pc.index(valid, value=False).as_py()
+        raise ValueError(
+            f"{path}: record {first_bad + 1} has an invalid token address "
+            f"{addresses[first_bad].as_py()!r}"
+        )
+    return pc.unique(addresses)
 
 
-def generate_output(
-    *,
-    logs_path: Path,
-    tokens_path: Path,
-    output_dir: Path,
-    metrics: Iterable[Metric],
-) -> list[Path]:
+def scan_transfers(
+    logs_path: Path, token_addresses: pa.Array[Any], *, batch_rows: int = BATCH_ROWS
+) -> Iterator[pa.RecordBatch]:
     """
-    Generate one output CSV per metric from the input files.
+    Stream the ERC-20 ``Transfer`` logs of the listed tokens.
+
+    Only the columns ``BLOCK_DATE``, ``ADDRESS`` and ``DATA`` are returned,
+    and the transfer filter is pushed down to the parquet scan; one file is
+    read at a time.
 
     Parameters
     ----------
     logs_path : Path
-        Decoded logs parquet file or directory.
-    tokens_path : Path
-        Token list CSV file.
-    output_dir : Path
-        Directory to write ``<metric>.csv`` files into; created if missing.
-    metrics : Iterable[Metric]
-        Metrics to generate, in order.
+        Decoded logs: a parquet file or a directory of parquet parts. Files
+        whose names start with ``_`` or ``.`` (Spark markers) are ignored.
+    token_addresses : pa.Array
+        Lower-case token addresses, as returned by `read_token_addresses`.
+    batch_rows : int, default `BATCH_ROWS`
+        Maximum rows per batch.
+
+    Yields
+    ------
+    pa.RecordBatch
+        Matching logs, with the columns ``BLOCK_DATE``, ``ADDRESS``, ``DATA``.
+    """
+    dataset = ds.dataset(logs_path, format="parquet")
+    yield from dataset.to_batches(
+        columns=list(INPUT_COLUMNS),
+        filter=erc20_transfer_filter(token_addresses),
+        batch_size=batch_rows,
+        batch_readahead=1,
+        fragment_readahead=1,
+    )
+
+
+def write_metric_csv(result: pd.DataFrame, path: Path) -> None:
+    """
+    Write a metric result as CSV.
+
+    Parameters
+    ----------
+    result : pd.DataFrame
+        Result of `ethereum_transfers.metrics.compute_metric`.
+    path : Path
+        Output file; its directory is created if missing.
+
+    Notes
+    -----
+    No index is written. Amounts are written as plain base-10 integers of any
+    size, so read them back as strings or `decimal.Decimal`, not floats.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    result.to_csv(path, index=False, lineterminator="\n")
+
+
+def write_head_sample(
+    input_path: Path,
+    output_path: Path,
+    *,
+    n_rows: int = SAMPLE_ROWS,
+    batch_rows: int = BATCH_ROWS,
+) -> int:
+    """
+    Write the first rows of a parquet dataset to a smaller file, streaming.
+
+    Rows are taken in file-name order. Only one batch is held in memory, so
+    this works on inputs far larger than memory.
+
+    Parameters
+    ----------
+    input_path : Path
+        Parquet file or directory of parquet parts.
+    output_path : Path
+        Gzip-compressed parquet file to write.
+    n_rows : int, default 1_000_000
+        Number of leading rows to keep.
+    batch_rows : int, default `BATCH_ROWS`
+        Maximum rows per batch (and per row group written).
 
     Returns
     -------
-    list[Path]
-        Paths of the CSV files written.
+    int
+        Number of rows written (fewer than `n_rows` if the input is smaller).
     """
-    df = join_tokens(pd.read_parquet(logs_path), pd.read_csv(tokens_path))
-    output_dir.mkdir(parents=True, exist_ok=True)
-    written: list[Path] = []
-    for metric in metrics:
-        result = compute_metric(df, metric)
-        logger.info("top token address per day by %s:\n%s", metric, result)
-        output_file = output_dir / f"{metric}.csv"
-        result.to_csv(output_file, index=False)
-        logger.info("wrote %d rows to %s", len(result), output_file)
-        written.append(output_file)
+    dataset = ds.dataset(input_path, format="parquet")
+    written = 0
+    with pq.ParquetWriter(output_path, dataset.schema, compression="gzip") as writer:
+        batches = dataset.to_batches(
+            batch_size=batch_rows, batch_readahead=1, fragment_readahead=1
+        )
+        for batch in batches:
+            if written >= n_rows:
+                break
+            head = batch.slice(0, n_rows - written)
+            writer.write_batch(head)
+            written += head.num_rows
+    logger.info("wrote the first %d rows of %s to %s", written, input_path, output_path)
     return written

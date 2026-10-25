@@ -1,24 +1,25 @@
-from collections.abc import Callable
 from datetime import date, timedelta
 from typing import cast
 
 import pandas as pd
 import pytest
 
-from ethereum_transfers.metrics import (
-    TOP_N,
-    Metric,
-    compute_metric,
-    count_of_transfers,
-    join_tokens,
-    quantity_transferred,
-)
+from ethereum_transfers.metrics import TOP_N, Metric, aggregate_column, compute_metric
 
-type MakeLogs = Callable[..., pd.DataFrame]
+A, B, C = ("0x" + c * 40 for c in "abc")
+D1, D2, D3 = "2023-04-01", "2023-04-02", "2023-04-03"
 
-# the addresses listed by the `tokens` fixture (see conftest.py)
-A, B, C, UNNAMED, NO_SYMBOL, UNLISTED = ("0x" + c * 40 for c in "abcdef")
-DAY_1, DAY_2, DAY_3 = date(2023, 4, 1), date(2023, 4, 2), date(2023, 4, 3)
+
+def aggregate(rows: list[tuple[str, str, int, int]]) -> pd.DataFrame:
+    """Build an aggregate frame from ``(day, token, count, amount)`` rows."""
+    return pd.DataFrame(
+        {
+            "day": [row[0] for row in rows],
+            "token_address": [row[1] for row in rows],
+            "transfer_count": pd.Series([row[2] for row in rows], dtype="int64"),
+            "transfer_amount": pd.Series([row[3] for row in rows], dtype=object),
+        }
+    )
 
 
 def rows(result: pd.DataFrame) -> list[tuple[object, ...]]:
@@ -34,184 +35,89 @@ def test_metric_values_name_the_output_columns_and_files() -> None:
     assert Metric("quantity_transferred") is Metric.QUANTITY_TRANSFERRED
 
 
-class TestJoinTokens:
-    def test_keeps_only_logs_of_listed_tokens(
-        self, make_logs: MakeLogs, tokens: pd.DataFrame
-    ) -> None:
-        logs = make_logs((A, DAY_1, 1), (UNLISTED, DAY_1, 1), (B, DAY_2, 1))
+def test_top_n_is_100() -> None:
+    assert TOP_N == 100
 
-        joined = join_tokens(logs, tokens)
 
-        assert joined["ADDRESS"].tolist() == [A, B]
-        assert joined["name"].tolist() == ["Token A", "Token B"]
-        assert joined["symbol"].tolist() == ["AAA", "BBB"]
-        assert "address" not in joined.columns
-        pd.testing.assert_index_equal(joined.index, pd.RangeIndex(2))
+@pytest.mark.parametrize(
+    ("metric", "column"),
+    [
+        (Metric.COUNT_OF_TRANSFERS, "transfer_count"),
+        (Metric.QUANTITY_TRANSFERRED, "transfer_amount"),
+    ],
+)
+def test_aggregate_column(metric: Metric, column: str) -> None:
+    assert aggregate_column(metric) == column
 
-    @pytest.mark.parametrize(
-        "address", [UNNAMED, NO_SYMBOL], ids=["no-name", "no-symbol"]
-    )
-    def test_drops_tokens_without_name_or_symbol(
-        self, make_logs: MakeLogs, tokens: pd.DataFrame, address: str
-    ) -> None:
-        logs = make_logs((address, DAY_1, 1), (A, DAY_1, 1))
 
-        assert join_tokens(logs, tokens)["ADDRESS"].tolist() == [A]
-
-    @pytest.mark.parametrize("column", ["ADDRESS", "PARAMS", "BLOCK_DATE"])
-    def test_drops_rows_with_a_null_key(
-        self, make_logs: MakeLogs, tokens: pd.DataFrame, column: str
-    ) -> None:
-        logs = make_logs((A, DAY_1, 1), (B, DAY_1, 1), (C, DAY_1, 1))
-        logs.loc[1, column] = None
-
-        joined = join_tokens(logs, tokens)
-
-        assert joined["ADDRESS"].tolist() == [A, C]
-        pd.testing.assert_index_equal(joined.index, pd.RangeIndex(2))
+def test_aggregate_column_rejects_an_unknown_metric() -> None:
+    bogus = cast("Metric", "bogus")
+    with pytest.raises(AssertionError, match="unreachable"):
+        aggregate_column(bogus)
 
 
 class TestCountOfTransfers:
-    def test_keeps_the_top_token_of_each_day(self, make_logs: MakeLogs) -> None:
-        logs = make_logs(
-            (A, DAY_1, 1),
-            (B, DAY_1, 1),
-            (A, DAY_1, 1),
-            (A, DAY_1, 1),
-            (C, DAY_2, 1),
-            (B, DAY_2, 1),
-            (B, DAY_2, 1),
+    def test_keeps_the_top_token_of_each_day(self) -> None:
+        agg = aggregate([(D1, A, 3, 1), (D1, B, 1, 100), (D2, B, 2, 1), (D2, C, 1, 9)])
+
+        result = compute_metric(agg, Metric.COUNT_OF_TRANSFERS)
+
+        assert list(result.columns) == ["day", "token_address", "count_of_transfers"]
+        assert rows(result) == [(D1, A, 3), (D2, B, 2)]
+
+    def test_orders_days_by_count_descending(self) -> None:
+        agg = aggregate([(D1, A, 1, 0), (D2, A, 5, 0), (D3, A, 3, 0)])
+
+        result = compute_metric(agg, Metric.COUNT_OF_TRANSFERS)
+
+        assert result["day"].tolist() == [D2, D3, D1]
+
+    def test_keeps_the_top_n_days(self) -> None:
+        start = date(2023, 1, 1)
+        agg = aggregate(
+            [((start + timedelta(days=i)).isoformat(), A, i + 1, 0) for i in range(150)]
         )
 
-        result = count_of_transfers(logs)
-
-        assert list(result.columns) == ["ADDRESS", "BLOCK_DATE", "count_of_transfers"]
-        assert rows(result) == [(A, DAY_1, 3), (B, DAY_2, 2)]
-
-    def test_orders_days_by_count_descending(self, make_logs: MakeLogs) -> None:
-        logs = make_logs(
-            (A, DAY_1, 1),
-            *[(B, DAY_2, 1)] * 3,
-            *[(C, DAY_3, 1)] * 2,
-        )
-
-        result = count_of_transfers(logs)
-
-        assert rows(result) == [(B, DAY_2, 3), (C, DAY_3, 2), (A, DAY_1, 1)]
-
-    def test_keeps_the_top_n_days(self, make_logs: MakeLogs) -> None:
-        # day i has i transfers, so the TOP_N busiest days are the last ones
-        n_days = TOP_N + 5
-        days = [DAY_1 + timedelta(days=i) for i in range(n_days)]
-        logs = make_logs(
-            *[(A, day, 1) for i, day in enumerate(days, start=1) for _ in range(i)]
-        )
-
-        result = count_of_transfers(logs)
+        result = compute_metric(agg, Metric.COUNT_OF_TRANSFERS)
 
         assert len(result) == TOP_N
-        assert result["count_of_transfers"].tolist() == list(range(n_days, 5, -1))
-        assert result["BLOCK_DATE"].tolist() == days[:4:-1]
+        assert result["count_of_transfers"].tolist() == list(range(150, 50, -1))
 
 
 class TestQuantityTransferred:
-    def test_returns_one_row_per_day(self, make_logs: MakeLogs) -> None:
-        logs = make_logs(
-            (A, DAY_1, 1),
-            (B, DAY_1, 1),
-            (B, DAY_2, 1),
-            (C, DAY_2, 1),
-            (C, DAY_3, 1),
+    def test_keeps_the_top_token_of_each_day_by_exact_amount(self) -> None:
+        agg = aggregate(
+            [(D1, A, 9, 2**256), (D1, B, 1, 2**256 + 1), (D2, A, 1, 5), (D2, C, 7, 4)]
         )
 
-        result = quantity_transferred(logs)
+        result = compute_metric(agg, Metric.QUANTITY_TRANSFERRED)
 
-        assert list(result.columns) == [
-            "ADDRESS",
-            "BLOCK_DATE",
-            "quantity_transferred",
-        ]
-        assert sorted(result["BLOCK_DATE"]) == [DAY_1, DAY_2, DAY_3]
+        assert list(result.columns) == ["day", "token_address", "quantity_transferred"]
+        assert rows(result) == [(D1, B, 2**256 + 1), (D2, A, 5)]
 
-    def test_keeps_the_top_token_of_each_day(self, make_logs: MakeLogs) -> None:
-        # equal amounts: the top token is the one with the most transfers
-        logs = make_logs(
-            (A, DAY_1, 1),
-            (A, DAY_1, 1),
-            (B, DAY_1, 1),
-            (A, DAY_2, 1),
-            (B, DAY_2, 1),
-            (B, DAY_2, 1),
-            (B, DAY_2, 1),
-        )
+    def test_returns_one_row_per_day(self) -> None:
+        agg = aggregate([(D1, A, 1, 1), (D1, B, 1, 2), (D2, A, 1, 3), (D3, C, 1, 0)])
 
-        result = quantity_transferred(logs)
+        result = compute_metric(agg, Metric.QUANTITY_TRANSFERRED)
 
-        winners = dict(zip(result["BLOCK_DATE"], result["ADDRESS"], strict=True))
-        assert winners == {DAY_1: A, DAY_2: B}
-
-    def test_keeps_at_most_top_n_days(self, make_logs: MakeLogs) -> None:
-        days = [DAY_1 + timedelta(days=i) for i in range(TOP_N + 5)]
-        logs = make_logs(*[(A, day, 1) for day in days])
-
-        result = quantity_transferred(logs)
-
-        assert len(result) == TOP_N
-        assert result["BLOCK_DATE"].is_unique
+        assert result["day"].is_unique
+        assert len(result) == 3
 
 
-@pytest.mark.parametrize(
-    ("metric", "function"),
-    [
-        (Metric.COUNT_OF_TRANSFERS, count_of_transfers),
-        (Metric.QUANTITY_TRANSFERRED, quantity_transferred),
-    ],
-)
-def test_compute_metric_dispatches_to_the_metric_function(
-    logs: pd.DataFrame,
-    tokens: pd.DataFrame,
-    metric: Metric,
-    function: Callable[[pd.DataFrame], pd.DataFrame],
-) -> None:
-    joined = join_tokens(logs, tokens)
+@pytest.mark.parametrize("metric", list(Metric))
+def test_per_day_and_limit_are_passed_through(metric: Metric) -> None:
+    agg = aggregate([(D1, A, 3, 3), (D1, B, 2, 2), (D2, C, 1, 1)])
 
-    result = compute_metric(joined, metric)
+    result = compute_metric(agg, metric, per_day=None, limit=2)
 
-    pd.testing.assert_frame_equal(result, function(joined))
-    assert list(result.columns) == ["ADDRESS", "BLOCK_DATE", metric]
+    assert rows(result) == [(D1, A, 3), (D1, B, 2)]
 
 
-def test_compute_metric_rejects_an_unknown_metric(
-    logs: pd.DataFrame, tokens: pd.DataFrame
-) -> None:
-    with pytest.raises(AssertionError, match="unreachable"):
-        compute_metric(join_tokens(logs, tokens), cast("Metric", "bogus"))
+@pytest.mark.parametrize("metric", list(Metric))
+def test_compute_metric_does_not_modify_its_input(metric: Metric) -> None:
+    agg = aggregate([(D1, A, 3, 3), (D1, B, 2, 2)])
+    before = agg.copy()
 
+    compute_metric(agg, metric)
 
-@pytest.mark.parametrize(
-    "function",
-    [count_of_transfers, quantity_transferred],
-    ids=lambda function: function.__name__,
-)
-def test_metric_functions_do_not_modify_their_input(
-    logs: pd.DataFrame,
-    tokens: pd.DataFrame,
-    function: Callable[[pd.DataFrame], pd.DataFrame],
-) -> None:
-    joined = join_tokens(logs, tokens)
-    before = joined.copy()
-
-    function(joined)
-
-    pd.testing.assert_frame_equal(joined, before)
-
-
-def test_join_tokens_does_not_modify_its_inputs(
-    logs: pd.DataFrame, tokens: pd.DataFrame
-) -> None:
-    logs_before, tokens_before = logs.copy(), tokens.copy()
-
-    join_tokens(logs, tokens)
-
-    pd.testing.assert_frame_equal(logs, logs_before)
-    pd.testing.assert_frame_equal(tokens, tokens_before)
+    pd.testing.assert_frame_equal(agg, before)

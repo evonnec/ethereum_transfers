@@ -1,135 +1,208 @@
-from collections.abc import Callable
-from datetime import date
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
-from ethereum_transfers.files import generate_output, write_new_output
-from ethereum_transfers.metrics import Metric
+from ethereum_transfers.files import (
+    read_token_addresses,
+    scan_transfers,
+    write_head_sample,
+    write_metric_csv,
+)
 
-type MakeLogs = Callable[..., pd.DataFrame]
-type WriteInputs = Callable[[pd.DataFrame, pd.DataFrame], tuple[Path, Path]]
+if TYPE_CHECKING:
+    from conftest import LogFactory, MakeTokens
 
-# the addresses listed by the `tokens` fixture (see conftest.py)
-A, B = ("0x" + c * 40 for c in "ab")
-DAY_1, DAY_2 = date(2023, 4, 1), date(2023, 4, 2)
+A, B, C = ("0x" + c * 40 for c in "abc")
 
 
-class TestGenerateOutput:
-    def test_writes_one_csv_per_metric_into_a_new_directory(
-        self, inputs: tuple[Path, Path], tmp_path: Path
-    ) -> None:
-        logs_path, tokens_path = inputs
-        output_dir = tmp_path / "nested" / "out"
+def write_csv(path: Path, text: str) -> Path:
+    path.write_text(text)
+    return path
 
-        written = generate_output(
-            logs_path=logs_path,
-            tokens_path=tokens_path,
-            output_dir=output_dir,
-            metrics=list(Metric),
+
+def amounts(table: pa.Table) -> list[int]:
+    """Decode the DATA column of `table` with plain Python ints."""
+    return [int(str(data), 16) for data in table["DATA"].to_pylist()]
+
+
+# --- read_token_addresses (review section 7.4, K1-K6) --------------------------
+
+
+class TestReadTokenAddresses:
+    def test_deduplicates_and_lower_cases(self, tmp_path: Path) -> None:  # K1, K2
+        path = write_csv(
+            tmp_path / "tokens.csv",
+            f"address,symbol\n{A},AAA\n{A},AAA\n{B.upper().replace('0X', '0x')},BBB\n"
+            f"{A},AAA\n",
         )
 
-        assert written == [
-            output_dir / "count_of_transfers.csv",
-            output_dir / "quantity_transferred.csv",
-        ]
-        assert sorted(output_dir.iterdir()) == written
+        assert read_token_addresses(path).to_pylist() == [A, B]
 
-    @pytest.mark.parametrize("metric", list(Metric))
-    def test_csv_has_a_header_and_one_row_per_day(
-        self,
-        inputs: tuple[Path, Path],
-        logs: pd.DataFrame,
-        tmp_path: Path,
-        metric: Metric,
-    ) -> None:
-        logs_path, tokens_path = inputs
-
-        [path] = generate_output(
-            logs_path=logs_path,
-            tokens_path=tokens_path,
-            output_dir=tmp_path,
-            metrics=[metric],
+    def test_keeps_tokens_without_metadata(
+        self, make_tokens: "MakeTokens", tmp_path: Path
+    ) -> None:  # K3
+        path = tmp_path / "tokens.csv"
+        make_tokens((A, None, None), (B, "", ""), (C, "CCC", "Token C")).to_csv(
+            path, index=False
         )
 
-        header, *body = path.read_text().splitlines()
-        assert header == f"ADDRESS,BLOCK_DATE,{metric}"
-        # every day in the `logs` fixture has a log from a named token
-        assert len(body) == logs["BLOCK_DATE"].nunique()
+        assert read_token_addresses(path).to_pylist() == [A, B, C]
+
+    def test_ignores_na_like_names_and_symbols(self, tmp_path: Path) -> None:  # K4
+        path = write_csv(
+            tmp_path / "tokens.csv",
+            f"address,symbol,name\n{A},NA,NULL\n{B},nan,None\n",
+        )
+
+        assert read_token_addresses(path).to_pylist() == [A, B]
 
     @pytest.mark.parametrize(
-        "metrics",
-        [
-            [Metric.COUNT_OF_TRANSFERS],
-            [Metric.QUANTITY_TRANSFERRED],
-            [Metric.QUANTITY_TRANSFERRED, Metric.COUNT_OF_TRANSFERS],
-        ],
-        ids=["count", "quantity", "quantity+count"],
+        "bad",
+        ["0x123", "", "0x" + "g" * 40, "aa" * 21],
+        ids=["short", "empty", "hex", "no-0x"],
     )
-    def test_writes_only_the_requested_metrics_in_order(
-        self, inputs: tuple[Path, Path], tmp_path: Path, metrics: list[Metric]
+    def test_rejects_invalid_addresses(self, tmp_path: Path, bad: str) -> None:  # K5
+        path = write_csv(tmp_path / "tokens.csv", f"address,symbol\n{A},A\n{bad},X\n")
+
+        with pytest.raises(ValueError, match="record 2 has an invalid token address"):
+            read_token_addresses(path)
+
+    def test_parses_quoted_multi_line_fields(self, tmp_path: Path) -> None:  # K6
+        path = write_csv(
+            tmp_path / "tokens.csv",
+            f'address,name\n{A},"two\nlines"\n{B},"say ""hi"""\n',
+        )
+
+        assert read_token_addresses(path).to_pylist() == [A, B]
+
+    def test_requires_an_address_column(self, tmp_path: Path) -> None:
+        path = write_csv(tmp_path / "tokens.csv", "token,symbol\nx,y\n")
+
+        with pytest.raises(ValueError, match="no 'address' column"):
+            read_token_addresses(path)
+
+
+# --- scan_transfers -----------------------------------------------------------
+
+
+class TestScanTransfers:
+    def test_streams_only_listed_erc20_transfers_and_three_columns(
+        self, factory: "LogFactory", tmp_path: Path
     ) -> None:
-        logs_path, tokens_path = inputs
-        output_dir = tmp_path / "out"
-
-        written = generate_output(
-            logs_path=logs_path,
-            tokens_path=tokens_path,
-            output_dir=output_dir,
-            metrics=metrics,
+        day = factory.DAY_1
+        path = factory.write_dataset(
+            tmp_path / "logs",
+            [
+                factory.erc20(A, day, 1),
+                factory.erc721(A, day, 2),
+                factory.approval(A, day, 3),
+                factory.erc20(B, day, 4),
+                factory.erc20(factory.UNLISTED, day, 5),
+                factory.erc20(A, day, 6),
+            ],
+            parts=3,
         )
 
-        assert [path.name for path in written] == [f"{m}.csv" for m in metrics]
-        assert sorted(output_dir.iterdir()) == sorted(written)
+        batches = list(scan_transfers(path, pa.array([A, B]), batch_rows=1))
 
-    def test_count_csv_format(
-        self,
-        make_logs: MakeLogs,
-        tokens: pd.DataFrame,
-        write_inputs: WriteInputs,
-        tmp_path: Path,
+        assert all(batch.num_rows <= 1 for batch in batches)
+        table = pa.Table.from_batches(batches)
+        assert table.column_names == ["BLOCK_DATE", "ADDRESS", "DATA"]
+        assert sorted(amounts(table)) == [1, 4, 6]
+
+    def test_reads_a_single_parquet_file(
+        self, factory: "LogFactory", tmp_path: Path
     ) -> None:
-        logs_path, tokens_path = write_inputs(
-            make_logs((A, DAY_1, 1), (B, DAY_2, 1), (B, DAY_2, 1)), tokens
+        path = tmp_path / "logs.parquet"
+        pq.write_table(factory.table([factory.erc20(A, factory.DAY_1, 9)]), path)
+
+        table = pa.Table.from_batches(list(scan_transfers(path, pa.array([A]))))
+
+        assert table["ADDRESS"].to_pylist() == [A]
+
+    def test_no_matching_rows(self, factory: "LogFactory", tmp_path: Path) -> None:
+        path = factory.write_dataset(
+            tmp_path / "logs", [factory.erc20(A, factory.DAY_1, 1)]
         )
 
-        [path] = generate_output(
-            logs_path=logs_path,
-            tokens_path=tokens_path,
-            output_dir=tmp_path / "out",
-            metrics=[Metric.COUNT_OF_TRANSFERS],
+        batches = scan_transfers(path, pa.array([B]))
+
+        assert sum(batch.num_rows for batch in batches) == 0
+
+
+# --- write_metric_csv (W1-W3) ------------------------------------------------
+
+
+class TestWriteMetricCsv:
+    def test_writes_exact_integers_without_an_index(self, tmp_path: Path) -> None:
+        result = pd.DataFrame(
+            {
+                "day": ["2023-04-01", "2023-04-02"],
+                "token_address": [A, B],
+                "quantity_transferred": pd.Series([2**256 - 1, 0], dtype=object),
+            }
         )
+        path = tmp_path / "nested" / "dir" / "quantity_transferred.csv"
+
+        write_metric_csv(result, path)
 
         assert path.read_text() == (
-            "ADDRESS,BLOCK_DATE,count_of_transfers\n"
-            f"{B},2023-04-02,2\n"
-            f"{A},2023-04-01,1\n"
+            "day,token_address,quantity_transferred\n"
+            f"2023-04-01,{A},{2**256 - 1}\n"
+            f"2023-04-02,{B},0\n"
         )
 
+    def test_empty_result_writes_the_header(self, tmp_path: Path) -> None:
+        path = tmp_path / "count_of_transfers.csv"
 
-class TestWriteNewOutput:
-    @pytest.mark.parametrize("n_rows", [1, 4, 1000])
-    def test_keeps_the_first_rows(
-        self, inputs: tuple[Path, Path], tmp_path: Path, n_rows: int
+        write_metric_csv(
+            pd.DataFrame(columns=["day", "token_address", "count_of_transfers"]), path
+        )
+
+        assert path.read_text() == "day,token_address,count_of_transfers\n"
+
+
+# --- write_head_sample -------------------------------------------------------
+
+
+class TestWriteHeadSample:
+    @pytest.mark.parametrize("n_rows", [0, 1, 4, 7, 1000])
+    def test_keeps_the_first_rows_in_file_order(
+        self, factory: "LogFactory", tmp_path: Path, n_rows: int
+    ) -> None:
+        logs = [factory.erc20(A, factory.DAY_1, amount) for amount in range(7)]
+        source = factory.write_dataset(tmp_path / "logs", logs, parts=3)
+        output = tmp_path / "sample.gzip"
+
+        written = write_head_sample(source, output, n_rows=n_rows, batch_rows=2)
+
+        sample = pq.read_table(output)
+        assert written == sample.num_rows == min(n_rows, len(logs))
+        assert amounts(sample) == list(range(written))
+        assert sample.schema.equals(factory.table([]).schema)
+
+    def test_matches_pandas_head_of_a_single_file(
+        self, inputs: tuple[Path, Path], tmp_path: Path
     ) -> None:
         logs_path, _ = inputs
         output = tmp_path / "sample.gzip"
 
-        write_new_output(logs_path, output, n_rows=n_rows)
+        write_head_sample(logs_path, output, n_rows=4)
 
-        expected = pd.read_parquet(logs_path).head(n_rows)
+        expected = pd.read_parquet(logs_path).head(4)
         pd.testing.assert_frame_equal(pd.read_parquet(output), expected)
 
-    def test_reads_a_directory_of_parquet_parts(
-        self, logs: pd.DataFrame, tmp_path: Path
-    ) -> None:
-        source = tmp_path / "dataset"
-        source.mkdir()
-        logs.iloc[:6].to_parquet(source / "part-00000.parquet", index=False)
-        logs.iloc[6:].to_parquet(source / "part-00001.parquet", index=False)
+    def test_writes_gzip_parquet(self, factory: "LogFactory", tmp_path: Path) -> None:
+        source = factory.write_dataset(
+            tmp_path / "logs", [factory.erc20(A, factory.DAY_1, 1)]
+        )
         output = tmp_path / "sample.gzip"
 
-        write_new_output(source, output)
+        write_head_sample(source, output)
 
-        pd.testing.assert_frame_equal(pd.read_parquet(output), logs)
+        metadata = pq.ParquetFile(output).metadata
+        assert metadata.row_group(0).column(0).compression == "GZIP"
