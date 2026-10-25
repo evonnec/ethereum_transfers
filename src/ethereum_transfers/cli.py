@@ -236,6 +236,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
 
+    inputs = (
+        {"--logs": args.logs, "--tokens": args.tokens}
+        if args.command == "run"
+        else {"--input": args.input}
+    )
+    for flag, path in inputs.items():
+        if not path.exists():
+            print(
+                f"{parser.prog}: error: {flag} {path} does not exist", file=sys.stderr
+            )
+            return 1
+
     try:
         match args.command:
             case "run":

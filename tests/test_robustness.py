@@ -46,7 +46,9 @@ class TestUserErrorsAreReported:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         missing = tmp_path / "nope"
-        assert_clean_failure(run(missing, inputs[1], tmp_path / "o"), capsys, "nope")
+        assert_clean_failure(
+            run(missing, inputs[1], tmp_path / "o"), capsys, "--logs", "nope"
+        )
 
     def test_missing_tokens_path(
         self,
@@ -56,8 +58,23 @@ class TestUserErrorsAreReported:
     ) -> None:
         missing = tmp_path / "nope.csv"
         assert_clean_failure(
-            run(inputs[0], missing, tmp_path / "o"), capsys, "nope.csv"
+            run(inputs[0], missing, tmp_path / "o"), capsys, "--tokens", "nope.csv"
         )
+
+    def test_missing_sample_input_path(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        code = main(
+            [
+                "sample",
+                "--input",
+                str(tmp_path / "nope"),
+                "--output",
+                str(tmp_path / "s"),
+            ]
+        )
+        assert_clean_failure(code, capsys, "--input", "nope")
+        assert not (tmp_path / "s").exists()
 
     @pytest.mark.parametrize(
         "markers", [[], ["_SUCCESS"]], ids=["empty", "success-only"]
