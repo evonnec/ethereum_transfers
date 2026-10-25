@@ -31,6 +31,9 @@ SAMPLE_ROWS: Final = 1_000_000
 BATCH_ROWS: Final = 262_144
 """Maximum rows per record batch when streaming parquet input."""
 
+REQUIRED_COLUMNS: Final = (*INPUT_COLUMNS, "TOPIC0", "TOPIC3")
+"""Columns the logs must have: the filter reads two more than are returned."""
+
 _ADDRESS_PATTERN: Final = r"^0x[0-9a-f]{40}$"
 
 
@@ -69,15 +72,36 @@ def read_token_addresses(path: Path) -> pa.Array[Any]:
         )
     except pa.ArrowKeyError as error:
         raise ValueError(f"{path}: the token list has no 'address' column") from error
+    except pa.ArrowInvalid as error:
+        raise ValueError(f"{path}: cannot read the token list: {error}") from error
     addresses = pc.utf8_lower(table["address"]).combine_chunks()
     valid = pc.match_substring_regex(addresses, _ADDRESS_PATTERN)
-    if not pc.all(valid).as_py():
+    if not pc.all(valid, min_count=0).as_py():
         first_bad = pc.index(valid, value=False).as_py()
         raise ValueError(
             f"{path}: record {first_bad + 1} has an invalid token address "
             f"{addresses[first_bad].as_py()!r}"
         )
     return pc.unique(addresses)
+
+
+def open_logs(path: Path) -> ds.Dataset:
+    """
+    Open a parquet file or directory of parquet parts as a dataset.
+
+    Raises
+    ------
+    FileNotFoundError
+        If `path` does not exist.
+    ValueError
+        If `path` holds no parquet files (Spark markers do not count).
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"{path}: no such file or directory")
+    dataset = ds.dataset(path, format="parquet")
+    if not list(dataset.files):
+        raise ValueError(f"{path}: no parquet files found")
+    return dataset
 
 
 def scan_transfers(
@@ -105,7 +129,10 @@ def scan_transfers(
     pa.RecordBatch
         Matching logs, with the columns ``BLOCK_DATE``, ``ADDRESS``, ``DATA``.
     """
-    dataset = ds.dataset(logs_path, format="parquet")
+    dataset = open_logs(logs_path)
+    missing = [name for name in REQUIRED_COLUMNS if name not in dataset.schema.names]
+    if missing:
+        raise ValueError(f"{logs_path}: missing column(s): {', '.join(missing)}")
     yield from dataset.to_batches(
         columns=list(INPUT_COLUMNS),
         filter=erc20_transfer_filter(token_addresses),
@@ -164,7 +191,7 @@ def write_head_sample(
     int
         Number of rows written (fewer than `n_rows` if the input is smaller).
     """
-    dataset = ds.dataset(input_path, format="parquet")
+    dataset = open_logs(input_path)
     written = 0
     with pq.ParquetWriter(output_path, dataset.schema, compression="gzip") as writer:
         batches = dataset.to_batches(

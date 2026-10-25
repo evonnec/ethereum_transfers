@@ -67,12 +67,12 @@ def erc20_transfer_filter(
         (pushed down to the parquet scan) or ``pyarrow.Table.filter``.
     """
     expression = (
-        (ds.field("TOPIC0") == TRANSFER_TOPIC0)
+        (pc.utf8_lower(ds.field("TOPIC0")) == TRANSFER_TOPIC0)
         & ds.field("TOPIC3").is_null()
         & (pc.utf8_length(ds.field("DATA")) == WORD_HEX_LENGTH)
     )
     if token_addresses is not None:
-        expression &= ds.field("ADDRESS").isin(token_addresses)
+        expression &= pc.utf8_lower(ds.field("ADDRESS")).isin(token_addresses)
     return expression
 
 

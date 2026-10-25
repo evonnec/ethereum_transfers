@@ -30,9 +30,12 @@ Write a smaller parquet file with the first rows of the dataset:
 
 import argparse
 import logging
+import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Final
+
+import pyarrow as pa
 
 from ethereum_transfers import __version__
 from ethereum_transfers.files import SAMPLE_ROWS, write_head_sample
@@ -222,7 +225,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     Returns
     -------
     int
-        Process exit status.
+        Process exit status: 0 on success, 1 if the inputs or outputs are
+        unusable (the reason is printed to stderr), 2 for invalid arguments.
     """
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -232,16 +236,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
 
-    match args.command:
-        case "run":
-            generate_output(
-                logs_path=args.logs,
-                tokens_path=args.tokens,
-                output_dir=args.output_dir,
-                metrics=[Metric(metric) for metric in args.metrics],
-                per_day=args.per_day,
-                limit=args.limit,
-            )
-        case "sample":
-            write_head_sample(args.input, args.output, n_rows=args.rows)
+    try:
+        match args.command:
+            case "run":
+                generate_output(
+                    logs_path=args.logs,
+                    tokens_path=args.tokens,
+                    output_dir=args.output_dir,
+                    metrics=[Metric(metric) for metric in args.metrics],
+                    per_day=args.per_day,
+                    limit=args.limit,
+                )
+            case "sample":
+                write_head_sample(args.input, args.output, n_rows=args.rows)
+    except (OSError, ValueError, OverflowError, pa.ArrowException) as error:
+        print(f"{parser.prog}: error: {error}", file=sys.stderr)
+        return 1
     return 0
