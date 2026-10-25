@@ -1,177 +1,87 @@
-"""Rank token addresses per day by a transfer metric.
-
-The functions here are pure: they take and return DataFrames and do no IO.
+"""
+Transfer metrics and how each one ranks tokens per day.
 
 ``count_of_transfers``
-    Number of log rows per token address per day.
+    Number of ERC-20 ``Transfer`` logs per token per day.
 ``quantity_transferred``
-    Sum of the transferred ``value`` per token address per day.
+    Exact sum of the transferred amounts per token per day, in the token's raw
+    base units (no ``decimals`` scaling).
 
-Each metric keeps the top token address of each day, ordered by the metric
-descending and limited to `TOP_N` rows.
+`compute_metric` is pure: it takes the per-``(day, token)`` aggregate from
+`ethereum_transfers.aggregate.aggregate_transfers` and returns the ranked
+result with the columns ``day``, ``token_address`` and the metric name.
 """
 
-import json
 from enum import StrEnum
 from typing import Final, assert_never
 
 import pandas as pd
 
-TOP_N: Final = 100
+from ethereum_transfers.rank import DEFAULT_LIMIT, DEFAULT_PER_DAY, rank_top
+
+TOP_N: Final = DEFAULT_LIMIT
+"""Default maximum number of rows in a metric result."""
 
 
 class Metric(StrEnum):
-    """Transfer metric used to rank token addresses per day."""
+    """Transfer metric used to rank tokens per day; names the output file."""
 
     COUNT_OF_TRANSFERS = "count_of_transfers"
     QUANTITY_TRANSFERRED = "quantity_transferred"
 
 
-def join_tokens(logs: pd.DataFrame, tokens: pd.DataFrame) -> pd.DataFrame:
+def aggregate_column(metric: Metric) -> str:
     """
-    Keep only the log rows emitted by a named token from the token list.
+    Return the aggregate column a metric ranks by.
 
     Parameters
     ----------
-    logs : pd.DataFrame
-        Decoded logs with at least ``ADDRESS``, ``PARAMS`` and ``BLOCK_DATE``.
-    tokens : pd.DataFrame
-        Token list as read from ``tokens.csv`` (``address``, ``name``,
-        ``symbol``, ...).
-
-    Returns
-    -------
-    pd.DataFrame
-        `logs` joined to `tokens` on the token address, with a fresh
-        ``RangeIndex``.
-
-    Notes
-    -----
-    Assumes every token in the list that has both a ``name`` and a ``symbol``
-    is an ERC-20 token. Rows missing ``ADDRESS``, ``PARAMS``, ``BLOCK_DATE`` or
-    a token ``name`` are dropped.
-    """
-    named_tokens = tokens.dropna(subset=["name", "symbol"], ignore_index=True).rename(
-        columns={"address": "ADDRESS"}
-    )
-    return logs.merge(named_tokens, how="left", on="ADDRESS").dropna(
-        subset=["ADDRESS", "PARAMS", "BLOCK_DATE", "name"], ignore_index=True
-    )
-
-
-def count_of_transfers(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Find the token address with the most transfers on each day.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Token logs as returned by `join_tokens`.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns ``ADDRESS``, ``BLOCK_DATE`` and ``count_of_transfers``, one row
-        per day, ordered by ``count_of_transfers`` descending, at most `TOP_N`
-        rows.
-    """
-    count_df = (
-        df.groupby(["ADDRESS", "BLOCK_DATE"]).size().to_frame("count_of_transfers")
-    )
-    # number the addresses within each day by count of transfers, descending
-    count_df["row_num"] = (
-        count_df.sort_values(by=["count_of_transfers", "BLOCK_DATE"], ascending=False)
-        .groupby("BLOCK_DATE")
-        .cumcount()
-        + 1
-    )
-    top_transferred_address_per_day = count_df[count_df["row_num"] == 1].drop(
-        columns="row_num"
-    )
-    result = top_transferred_address_per_day.sort_values(
-        by="count_of_transfers", ascending=False
-    ).head(TOP_N)
-    return result.reset_index()
-
-
-def quantity_transferred(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Find the token address with the largest quantity transferred on each day.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Token logs as returned by `join_tokens`.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns ``ADDRESS``, ``BLOCK_DATE`` and ``quantity_transferred``, one
-        row per day, ordered by ``quantity_transferred`` descending, at most
-        `TOP_N` rows.
-    """
-    transfers = df[["ADDRESS", "BLOCK_DATE", "PARAMS"]]
-    # PARAMS is the JSON string of the decoded event arguments; for a transfer
-    # its keys are ``from``, ``to`` and ``value`` (the amount transferred).
-    # https://medium.com/@eiki1212/ethereum-transaction-structure-explained-aa5a94182ad6
-    transfers["PARAMS"] = transfers["PARAMS"][1]
-    transfers["PARAMS"] = transfers["PARAMS"].apply(json.loads)
-    transfers["value_transferred"] = transfers["PARAMS"].apply(
-        lambda params: params["value"]
-    )
-    # sum the value transferred per address per day and broadcast it to the rows
-    # as a categorical (per-row codes into the per-group sums). Under pandas 3 a
-    # ``str`` column -- what ``transform("sum")`` returns, and what sorting turns
-    # an object column into -- stores its own copy of the group's sum in every
-    # row. The categories are sorted, so the ordering below is unchanged.
-    quantity = (
-        transfers.groupby(["ADDRESS", "BLOCK_DATE"])["value_transferred"]
-        .sum()
-        .astype("category")
-        .rename("quantity_transferred")
-    )
-    transfers = transfers.join(quantity, on=["ADDRESS", "BLOCK_DATE"])
-    # number the rows within each day by quantity transferred, descending
-    transfers["row_num"] = (
-        transfers.sort_values(
-            by=["BLOCK_DATE", "quantity_transferred"], ascending=False
-        )
-        .groupby("BLOCK_DATE")
-        .cumcount()
-        + 1
-    )
-    # back to plain values for the final ordering of the (one per day) top rows
-    top_transferred_address_per_day = (
-        transfers[transfers["row_num"] == 1]
-        .drop(columns=["row_num", "PARAMS", "value_transferred"])
-        .astype({"quantity_transferred": object})
-    )
-    result = top_transferred_address_per_day.sort_values(
-        by="quantity_transferred", ascending=False
-    ).head(TOP_N)
-    return result.reset_index(drop=True)
-
-
-def compute_metric(df: pd.DataFrame, metric: Metric) -> pd.DataFrame:
-    """
-    Compute the top token address per day for the given metric.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Token logs as returned by `join_tokens`.
     metric : Metric
-        Metric to rank token addresses by.
+        The metric.
 
     Returns
     -------
-    pd.DataFrame
-        Columns ``ADDRESS``, ``BLOCK_DATE`` and a column named after `metric`.
+    str
+        ``"transfer_count"`` or ``"transfer_amount"``.
     """
     match metric:
         case Metric.COUNT_OF_TRANSFERS:
-            return count_of_transfers(df)
+            return "transfer_count"
         case Metric.QUANTITY_TRANSFERRED:
-            return quantity_transferred(df)
+            return "transfer_amount"
         case _:
             assert_never(metric)
+
+
+def compute_metric(
+    aggregate: pd.DataFrame,
+    metric: Metric,
+    *,
+    per_day: int | None = DEFAULT_PER_DAY,
+    limit: int | None = TOP_N,
+) -> pd.DataFrame:
+    """
+    Rank tokens per day by one metric.
+
+    Parameters
+    ----------
+    aggregate : pd.DataFrame
+        Per-``(day, token)`` aggregate as returned by
+        `ethereum_transfers.aggregate.aggregate_transfers`.
+    metric : Metric
+        Metric to rank by.
+    per_day : int or None, default 1
+        Tokens kept per day; ``None`` ranks all ``(day, token)`` pairs together.
+    limit : int or None, default `TOP_N`
+        Maximum number of rows; ``None`` for no limit.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns ``day``, ``token_address`` and a column named after `metric`,
+        ordered by the metric descending, then day and token address ascending.
+        See `ethereum_transfers.rank.rank_top`.
+    """
+    column = aggregate_column(metric)
+    ranked = rank_top(aggregate, column, per_day=per_day, limit=limit)
+    return ranked.rename(columns={column: str(metric)})
