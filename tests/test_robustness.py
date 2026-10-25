@@ -202,3 +202,18 @@ class TestCaseVariantsInTheLogs:
         assert run(logs_path, tokens_path, tmp_path / "o") == 0
         result = pd.read_csv(tmp_path / "o" / "quantity_transferred.csv", dtype=str)
         assert result["quantity_transferred"].tolist() == ["510"]
+
+
+def test_log_with_a_fourth_topic_is_not_an_erc20_transfer_even_with_a_data_word(
+    make_logs: "MakeLogs",
+    write_inputs: "WriteInputs",
+    tokens: pd.DataFrame,
+    tmp_path: Path,
+) -> None:
+    """DATA alone is not enough: an indexed value (TOPIC3) means ERC-721 shape."""
+    logs = make_logs((A, DAY, 1), (A, DAY, 1000))
+    logs.loc[1, "TOPIC3"] = "0x" + "0" * 63 + "7"
+    logs_path, tokens_path = write_inputs(logs, tokens)
+    assert run(logs_path, tokens_path, tmp_path / "o") == 0
+    result = pd.read_csv(tmp_path / "o" / "quantity_transferred.csv", dtype=str)
+    assert result["quantity_transferred"].tolist() == ["1"]
